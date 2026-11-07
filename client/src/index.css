@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+:root {
+  font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+  color: #29261f;
+  background: #f5f1e8;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+@layer components {
+  .field {
+    @apply mt-2 block w-full rounded-xl border border-[#d9d0c0] bg-[#fffdf8] px-4 py-3 text-sm font-normal text-[#29261f] outline-none transition placeholder:text-[#a69b8a] focus:border-[#c75b39] focus:ring-4 focus:ring-[#c75b39]/10;
+  }
+
+  .button-primary {
+    @apply rounded-xl bg-[#c75b39] px-5 py-3 text-sm font-bold text-white shadow-[0_8px_20px_rgba(199,91,57,0.2)] transition hover:bg-[#aa472d] focus:outline-none focus:ring-4 focus:ring-[#c75b39]/25;
+  }
+
+  .button-secondary {
+    @apply rounded-xl border border-[#d2c7b6] bg-[#fffdf8] px-4 py-2.5 text-sm font-bold text-[#4d473d] transition hover:border-[#c75b39] hover:text-[#a9472e] focus:outline-none focus:ring-4 focus:ring-[#c75b39]/15;
+  }
+
+  .skeleton {
+    @apply animate-pulse rounded-2xl bg-[#e4dbcc];
+  }
+}
