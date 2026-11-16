@@ -62,6 +62,9 @@ export const sendOtpEmail = async (email, code) => {
   if (process.env.NODE_ENV === 'test') return
   if (process.env.NODE_ENV === 'development') {
     console.warn(`[DEV ONLY] OTP for ${email}: ${code}`)
+    if (!process.env.SMTP_HOST || !process.env.SMTP_PORT || !process.env.SMTP_USER || !process.env.SMTP_PASS || !process.env.MAIL_FROM) {
+      return
+    }
   }
   const transporter = createTransporter()
   try {

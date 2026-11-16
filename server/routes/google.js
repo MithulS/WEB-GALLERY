@@ -32,7 +32,13 @@ router.get('/callback', async (request, response) => {
 
   let userId
   try {
-    userId = jwt.verify(token, process.env.JWT_SECRET).userId
+    const payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] })
+    if (payload.type !== 'access') throw new Error('Invalid token type')
+    const user = await User.findById(payload.userId).select('+authTokenVersion emailVerified')
+    if (!user || !user.emailVerified || user.authTokenVersion !== payload.tokenVersion) {
+      throw new Error('Invalid session')
+    }
+    userId = user._id
   } catch {
     return response.redirect(`${clientOrigin}/login`)
   }

@@ -13,10 +13,15 @@ const photoSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
-    gridfsFileId: {
-      type: mongoose.Schema.Types.ObjectId,
+    cloudinaryPublicId: {
+      type: String,
       required: true,
       unique: true,
+      index: true,
+    },
+    cloudinaryUrl: {
+      type: String,
+      required: true,
     },
     size: {
       type: Number,

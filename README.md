@@ -5,7 +5,7 @@ Personal photo gallery with user authentication and optional Google Photos impor
 ## Stack
 
 - **Client:** React 19, Vite, Tailwind CSS, React Router, Axios (`client/`)
-- **Server:** Express 5, Mongoose (MongoDB), GridFS file storage, bcrypt, JWT (`server/`)
+- **Server:** Express 5, Mongoose (MongoDB), Cloudinary photo storage, bcrypt, JWT (`server/`)
 - **Tests:** Vitest, Supertest, mongodb-memory-server (`server/tests/`)
 
 ## Local setup
@@ -14,7 +14,7 @@ Personal photo gallery with user authentication and optional Google Photos impor
    ```sh
    cp .env.example .env
    ```
-   Fill in `MONGO_URI`, `JWT_SECRET` (32+ chars), `CLIENT_ORIGIN`, `TRUST_PROXY`, SMTP settings, and `MAIL_FROM`. Google variables are optional unless you use Google Photos import.
+   Fill in `MONGO_URI`, `JWT_SECRET` (32+ chars), `CLIENT_ORIGIN`, `TRUST_PROXY`, `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET`. SMTP settings are required for production email delivery. Google variables are optional unless you use Google login or Google Photos import.
 
 2. Install dependencies (root + workspaces):
    ```sh
@@ -29,7 +29,7 @@ Start the server with an in-memory MongoDB (no external database required):
 ```sh
 npm --prefix server run dev:local
 ```
-For real Gmail delivery, add `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=465`, `SMTP_SECURE=true`, `SMTP_USER=your Gmail address`, `SMTP_PASS=your 16-character Gmail App Password`, and `MAIL_FROM=Pic Web <your Gmail address>` to `server/.env`. Do not use your normal Gmail password. If these values are absent, local development prints the OTP to the server console with a `[DEV ONLY]` marker instead of sending email.
+Photo uploads are processed with Sharp and stored in Cloudinary as authenticated JPEG assets. JPEG, PNG, WebP, HEIC, and HEIF inputs are decoded and validated by Sharp; HEIC/HEIF inputs are safely converted to JPEG before storage. Add the Cloudinary credentials from your Cloudinary dashboard to `server/.env`. For real Gmail delivery, add `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=465`, `SMTP_SECURE=true`, `SMTP_USER=your Gmail address`, `SMTP_PASS=your 16-character Gmail App Password`, and `MAIL_FROM=Pic Web <your Gmail address>` to `server/.env`. Do not use your normal Gmail password. If these values are absent, local development prints the OTP to the server console with a `[DEV ONLY]` marker instead of sending email.
 
 Start the client (Vite dev server on http://localhost:5173, proxies `/api` to :5000):
 ```sh
@@ -38,7 +38,7 @@ npm --prefix client run dev
 
 Or run both from the root:
 ```sh
-npm run dev:local   # server only
+npm run dev:local   # server only, with in-memory MongoDB
 npm run dev         # client only
 ```
 
@@ -51,6 +51,8 @@ npm test
 ## Deployment security checklist
 
 - **Required server environment:** set a unique `MONGO_URI`, a randomly generated `JWT_SECRET` of at least 32 characters, `CLIENT_ORIGIN` to the exact HTTPS frontend origin, and `TRUST_PROXY` to the number of trusted reverse proxies (or the documented proxy configuration).
+- **Authentication cookies:** `COOKIE_SAME_SITE=lax` is the local/same-site default. Use `COOKIE_SAME_SITE=none` only when the frontend and API are on different sites and HTTPS is enabled; cookies are always `HttpOnly`, use `Path=/`, and are `Secure` in production.
+- **Cloudinary:** set `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET`; uploads cannot be stored until all three are configured.
 - **Email OTP environment:** set `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` (use a Gmail App Password, never a normal account password), and `MAIL_FROM`.
 - **Google OAuth, if enabled:** set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_AUTH_REDIRECT_URI`, and `GOOGLE_PHOTOS_REDIRECT_URI` to the exact registered callback URLs. For local development, the root `.env` is authoritative when both env files exist. Google Photos also needs a unique `GOOGLE_TOKEN_ENCRYPTION_KEY` of at least 32 characters.
 - **HTTPS:** terminate TLS at the proxy or hosting platform, serve the frontend and API over HTTPS, and verify HSTS. Production authentication cookies are Secure and will not work over plain HTTP.
@@ -69,11 +71,13 @@ npm test
 - `GET /api/auth/google/callback` — complete Google login OAuth
 - `POST /api/auth/logout` — clear cookie
 - `GET /api/auth/me` — current user
-- `GET /api/photos` — list your photos (paginated)
-- `POST /api/photos` — upload images (max 20 files, 10 MB each)
+- `GET /api/photos` — list all authenticated users' photos (paginated)
+- `POST /api/photos` — upload JPEG, PNG, WebP, or HEIC/HEIF images (max 20 files, 10 MB each)
 - `PATCH /api/photos/:id` — update a photo description (max 500 characters)
-- `GET /api/photos/:id/file` — download your photo
+- `GET /api/photos/:id/file` — view an authenticated user's photo
 - `DELETE /api/photos/:id` — delete your photo
 - `GET /api/health` — health check
 - `GET /api/google/auth` — start Google Photos OAuth
 - `GET /api/google/callback` — OAuth callback
+
+Google Photos import uses the official Picker API with the `photospicker.mediaitems.readonly` scope. The backend creates and owns picker sessions, polls until selection is complete, downloads each selected image from Google's temporary `baseUrl`, and immediately copies it into Cloudinary; Google URLs and tokens are never stored in the gallery. Google media URLs expire and are only valid for the permitted selected-media access window, so previously selected Google items cannot be re-downloaded through this app. Expired sessions, revoked authorization, inaccessible media, and partial imports are reported without exposing provider URLs or credentials.

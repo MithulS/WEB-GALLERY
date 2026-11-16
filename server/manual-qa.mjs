@@ -79,7 +79,7 @@ try {
 
   {
     const { status } = await api('GET', '/auth/me')
-    record('GET /me without cookie is 401', status === 401, `status=${status}`)
+    record('GET /me without cookie returns an anonymous user', status === 200, `status=${status}`)
   }
 
   {
@@ -91,17 +91,28 @@ try {
   clearJar()
   const ownerEmail = `owner_${Date.now()}@test.local`
   {
-    const { status, data, headers } = await api('POST', '/auth/register', {
+    const { status, data } = await api('POST', '/auth/register', {
       body: { name: 'Owner Tester', email: ownerEmail, password: 'password123' },
       expectStatus: 201,
     })
-    const setCookie = headers.getSetCookie?.().join(';') || ''
     record(
-      'Register creates user + httpOnly cookie',
-      status === 201 && data.user?.email === ownerEmail && setCookie.includes('HttpOnly') && !JSON.stringify(data).includes('passwordHash'),
-      `id=${data.user?.id}`,
+      'Register creates an unverified user',
+      status === 201 && data.verificationRequired === true && data.email === ownerEmail && !JSON.stringify(data).includes('passwordHash'),
+      `email=${data.email}`,
     )
   }
+
+  if (!/^\d{6}$/.test(process.env.PIC_WEB_QA_OTP || '')) {
+    throw new Error('Set PIC_WEB_QA_OTP to the six-digit OTP printed by the development server, then rerun manual QA.')
+  }
+  await api('POST', '/auth/verify-otp', {
+    body: { email: ownerEmail, otp: process.env.PIC_WEB_QA_OTP },
+    expectStatus: 200,
+  })
+  await api('POST', '/auth/login', {
+    body: { email: ownerEmail, password: 'password123' },
+    expectStatus: 200,
+  })
 
   {
     const { status, data } = await api('GET', '/auth/me', { expectStatus: 200 })
@@ -178,13 +189,11 @@ try {
   }
 
   {
-    const response = await fetch(`${base}/photos/${photoId}/file`, { headers: { Cookie: cookieHeader() } })
-    const buf = Buffer.from(await response.arrayBuffer())
-    const meta = await sharp(buf).metadata()
+    const response = await fetch(`${base}/photos/${photoId}/file`, { headers: { Cookie: cookieHeader() }, redirect: 'manual' })
     record(
-      'Photo file served as resized JPEG',
-      response.status === 200 && response.headers.get('content-type')?.includes('image/jpeg') && meta.format === 'jpeg' && meta.width <= 1600,
-      `w=${meta.width} h=${meta.height}`,
+      'Photo file redirects to Cloudinary',
+      response.status === 302 && response.headers.get('location')?.includes('res.cloudinary.com'),
+      `status=${response.status}`,
     )
   }
 

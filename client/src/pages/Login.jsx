@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/useAuth'
 
@@ -10,7 +10,19 @@ export default function Login() {
   const [error, setError] = useState('')
   const [resendAvailable, setResendAvailable] = useState(false)
   const [busy, setBusy] = useState(false)
-  const googleFailed = new URLSearchParams(location.search).get('error') === 'google_failed'
+  const query = new URLSearchParams(location.search)
+  const googleFailed = query.get('error') === 'google_failed'
+
+  useEffect(() => {
+    if (!googleFailed) return
+    const diagnostics = Object.fromEntries(new URLSearchParams(location.search).entries())
+    delete diagnostics.code
+    delete diagnostics.state
+    console.error('Google sign-in failed after OAuth callback', {
+      url: window.location.href,
+      query: diagnostics,
+    })
+  }, [googleFailed, location.search])
 
   const handleSubmit = async (event) => {
     event.preventDefault()

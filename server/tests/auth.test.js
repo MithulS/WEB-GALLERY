@@ -2,6 +2,7 @@ import { beforeAll, afterAll, afterEach, describe, expect, it, vi } from 'vitest
 import request from 'supertest'
 import mongoose from 'mongoose'
 import bcrypt from 'bcrypt'
+import jwt from 'jsonwebtoken'
 import { MongoMemoryServer } from 'mongodb-memory-server'
 import app from '../app.js'
 import User from '../models/User.js'
@@ -163,7 +164,8 @@ describe('authentication', () => {
     expect(response.status).toBe(200)
     expect(response.body.user.email).toBe(validUser.email)
     expect(response.headers['set-cookie']).toEqual(expect.arrayContaining([expect.stringContaining('HttpOnly')]))
-    expect(response.headers['set-cookie'].join(';')).toContain('SameSite=Strict')
+    expect(response.headers['set-cookie'].join(';')).toContain('SameSite=Lax')
+    expect(response.headers['set-cookie'].join(';')).toContain('Path=/')
   })
 
   it('stores passwords as bcrypt hashes and never as plaintext', async () => {
@@ -182,6 +184,26 @@ describe('authentication', () => {
       .send({ email: validUser.email, password: 'wrong-password' })
 
     expect(response.status).toBe(401)
+  })
+
+  it('rejects an expired access token on protected routes', async () => {
+    const user = await User.create({
+      name: 'Expired User',
+      email: 'expired@example.com',
+      emailVerified: true,
+    })
+    const expiredToken = jwt.sign(
+      { userId: user._id.toString(), tokenVersion: user.authTokenVersion, type: 'access' },
+      process.env.JWT_SECRET,
+      { expiresIn: -1, algorithm: 'HS256' },
+    )
+
+    const response = await request(app)
+      .get('/api/photos')
+      .set('Cookie', `token=${expiredToken}`)
+
+    expect(response.status).toBe(401)
+    expect(response.body.message).toBe('Invalid or expired token')
   })
 
   it('explains when a Google-only account has no password', async () => {
@@ -380,8 +402,9 @@ describe('authentication', () => {
     try {
       expect(authCookieOptions()).toEqual({
         httpOnly: true,
-        sameSite: 'strict',
+        sameSite: 'lax',
         secure: true,
+        path: '/',
       })
     } finally {
       process.env.NODE_ENV = previousEnvironment

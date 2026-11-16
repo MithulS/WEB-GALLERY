@@ -10,7 +10,6 @@ import { createOtp, isOtpResendAllowed, matchesOtp, maxOtpAttempts, maxOtpResend
 import { createGoogleLoginAuthUrl, exchangeGoogleLoginCode, isGoogleLoginConfigured } from '../services/googlePhotos.js'
 
 const router = express.Router()
-const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const cookieName = 'token'
 const googleLoginStateCookie = 'google_login_state'
 const maxNameLength = 100
@@ -101,8 +100,37 @@ const statesMatch = (expected, actual) => {
   return expectedBuffer.length === actualBuffer.length && crypto.timingSafeEqual(expectedBuffer, actualBuffer)
 }
 
+const googleQueryDiagnostics = (query) => ({
+  error: typeof query.error === 'string' ? query.error : undefined,
+  errorDescription: typeof query.error_description === 'string' ? query.error_description : undefined,
+  errorUri: typeof query.error_uri === 'string' ? query.error_uri : undefined,
+  hasCode: typeof query.code === 'string',
+  codeLength: typeof query.code === 'string' ? query.code.length : 0,
+  hasState: typeof query.state === 'string',
+  stateLength: typeof query.state === 'string' ? query.state.length : 0,
+})
+
+const googleErrorDiagnostics = (error) => ({
+  message: error instanceof Error ? error.message : String(error),
+  code: error?.code,
+  status: error?.response?.status,
+  responseBody: error?.response?.data,
+})
+
 router.get('/google', googleAuthRateLimit, (request, response) => {
-  if (!isGoogleLoginConfigured()) return response.redirect(googleLoginFailureRedirect())
+  console.info('Starting Google sign-in', {
+    configured: isGoogleLoginConfigured(),
+    clientOrigin: process.env.CLIENT_URL || process.env.CLIENT_ORIGIN,
+    redirectUri: process.env.GOOGLE_AUTH_REDIRECT_URI,
+  })
+  if (!isGoogleLoginConfigured()) {
+    console.error('Google sign-in is not configured', {
+      hasClientId: Boolean(process.env.GOOGLE_CLIENT_ID),
+      hasClientSecret: Boolean(process.env.GOOGLE_CLIENT_SECRET),
+      redirectUri: process.env.GOOGLE_AUTH_REDIRECT_URI,
+    })
+    return response.redirect(googleLoginFailureRedirect())
+  }
 
   const state = crypto.randomBytes(32).toString('base64url')
   const codeVerifier = crypto.randomBytes(32).toString('base64url')
@@ -113,6 +141,11 @@ router.get('/google', googleAuthRateLimit, (request, response) => {
 })
 
 router.get('/google/callback', googleAuthRateLimit, async (request, response) => {
+  console.info('Google sign-in callback received', {
+    redirectUri: process.env.GOOGLE_AUTH_REDIRECT_URI,
+    query: googleQueryDiagnostics(request.query),
+    hasStateCookie: Boolean(request.cookies?.[googleLoginStateCookie]),
+  })
   const stateCookie = request.cookies?.[googleLoginStateCookie]
   response.clearCookie(googleLoginStateCookie, authCookieOptions())
   const oauthState = readGoogleLoginState(stateCookie)
@@ -123,11 +156,25 @@ router.get('/google/callback', googleAuthRateLimit, async (request, response) =>
     || request.query.error
     || typeof request.query.code !== 'string'
   ) {
+    console.error('Google sign-in callback rejected before token exchange', {
+      reason: !oauthState
+        ? 'missing or malformed state cookie'
+        : !statesMatch(oauthState.state, request.query.state)
+          ? 'state mismatch'
+          : request.query.error
+            ? 'Google returned an OAuth error'
+            : 'missing authorization code',
+      query: googleQueryDiagnostics(request.query),
+    })
     return response.redirect(googleLoginFailureRedirect())
   }
 
   try {
     const identity = await exchangeGoogleLoginCode(request.query.code, oauthState.codeVerifier)
+    console.info('Google authorization code exchanged and identity verified', {
+      googleId: identity.googleId,
+      email: identity.email,
+    })
     let user = await User.findOne({ googleId: identity.googleId }).select('+authTokenVersion +refreshTokenHash +googleRefreshToken +passwordHash')
 
     if (!user) {
@@ -153,9 +200,10 @@ router.get('/google/callback', googleAuthRateLimit, async (request, response) =>
     }
 
     await setSessionCookies(user, response)
+    console.info('Google sign-in completed', { userId: user._id.toString(), email: user.email })
     return response.redirect(galleryRedirect())
   } catch (error) {
-    console.error('Google sign-in callback failed:', error.response?.data?.error_description || error.message)
+    console.error('Google sign-in callback failed', googleErrorDiagnostics(error))
     return response.redirect(googleLoginFailureRedirect())
   }
 })
@@ -339,10 +387,21 @@ router.post('/resend-otp', authRateLimit, async (request, response) => {
 })
 
 router.post('/logout', async (request, response) => {
-  const token = request.cookies?.token
+  const accessToken = request.cookies?.token
+  const refreshToken = request.cookies?.refreshToken
   try {
-    if (token) {
-      const payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] })
+    let payload
+    try {
+      payload = accessToken
+        ? jwt.verify(accessToken, process.env.JWT_SECRET, { algorithms: ['HS256'] })
+        : null
+    } catch {
+      payload = null
+    }
+    if (!payload && refreshToken) {
+      payload = jwt.verify(refreshToken, process.env.JWT_SECRET, { algorithms: ['HS256'] })
+    }
+    if (payload?.userId) {
       await User.findByIdAndUpdate(payload.userId, { $inc: { authTokenVersion: 1 }, $unset: { refreshTokenHash: 1 } })
     }
   } catch {

@@ -2,9 +2,13 @@ import jwt from 'jsonwebtoken'
 import User from '../models/User.js'
 
 const getCookieOptions = () => ({
+  // SameSite=None is only valid over HTTPS, so force Secure for that mode.
   httpOnly: true,
-  sameSite: 'strict',
-  secure: process.env.NODE_ENV === 'production',
+  sameSite: ['strict', 'lax', 'none'].includes(process.env.COOKIE_SAME_SITE?.toLowerCase())
+    ? process.env.COOKIE_SAME_SITE.toLowerCase()
+    : 'lax',
+  secure: process.env.NODE_ENV === 'production' || process.env.COOKIE_SAME_SITE?.toLowerCase() === 'none',
+  path: '/',
 })
 
 export const authCookieOptions = getCookieOptions

@@ -8,10 +8,11 @@ import User from '../models/User.js'
 import GooglePickerSession from '../models/GooglePickerSession.js'
 import { requireAuth } from '../middleware/auth.js'
 import { decryptGoogleToken, getGoogleAccessToken } from '../services/googlePhotos.js'
-import { deleteGridFsFile, findGridFsFile, getUserStorageUsage, maxStorageBytes, openGridFsDownload, processAndStorePhoto } from '../services/photoStorage.js'
+import { deleteCloudinaryPhoto, getCloudinaryPhotoUrl, getUserStorageUsage, maxStorageBytes, processAndStorePhoto } from '../services/photoStorage.js'
 
 const router = express.Router()
-const allowedMimeTypes = new Set(['image/jpeg', 'image/png', 'image/webp'])
+const allowedMimeTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'])
+const allowedExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif'])
 const maxFileSize = 10 * 1024 * 1024
 const maxFilesPerUpload = 20
 const maxDescriptionLength = 500
@@ -23,8 +24,9 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: maxFileSize, files: maxFilesPerUpload },
   fileFilter: (_request, file, callback) => {
-    if (!allowedMimeTypes.has(file.mimetype)) {
-      return callback(new Error('Only JPEG, PNG, and WebP images are allowed'))
+    const extension = file.originalname?.slice(file.originalname.lastIndexOf('.')).toLowerCase()
+    if (!allowedMimeTypes.has(file.mimetype) && !allowedExtensions.has(extension)) {
+      return callback(new Error('Only JPEG, PNG, WebP, and HEIC images are allowed'))
     }
     return callback(null, true)
   },
@@ -73,6 +75,14 @@ const googleImportRateLimit = rateLimit({
 
 const googleApiBase = 'https://photospicker.googleapis.com/v1'
 
+class GooglePhotosApiError extends Error {
+  constructor(status, message) {
+    super(message)
+    this.name = 'GooglePhotosApiError'
+    this.status = status
+  }
+}
+
 const googleRequest = async (url, token, options = {}) => {
   const googleResponse = await fetch(url, {
     ...options,
@@ -84,7 +94,7 @@ const googleRequest = async (url, token, options = {}) => {
   if (!googleResponse.ok) {
     const body = await googleResponse.text().catch(() => '')
     console.error('Google Photos API error:', googleResponse.status, body)
-    throw new Error(`Google Photos request failed: ${googleResponse.status}`)
+    throw new GooglePhotosApiError(googleResponse.status, `Google Photos request failed: ${googleResponse.status}`)
   }
   return googleResponse.json()
 }
@@ -92,14 +102,26 @@ const googleRequest = async (url, token, options = {}) => {
 const getGoogleTokenForUser = async (userId) => {
   const user = await User.findById(userId).select('+googleRefreshToken')
   if (!user?.googleRefreshToken) return null
-  return getGoogleAccessToken(decryptGoogleToken(user.googleRefreshToken))
+  try {
+    return await getGoogleAccessToken(decryptGoogleToken(user.googleRefreshToken))
+  } catch (error) {
+    if (error.response?.data?.error === 'invalid_grant') {
+      await User.updateOne({ _id: userId }, { $unset: { googleRefreshToken: 1 } })
+      return null
+    }
+    throw error
+  }
 }
 
 const getOwnedPickerSession = (sessionId, userId) => GooglePickerSession.findOne({ sessionId, owner: userId })
 
 const downloadGoogleImage = async (baseUrl, token) => {
-  const googleResponse = await fetch(`${baseUrl}=d`, { headers: { Authorization: `Bearer ${token}` } })
-  if (!googleResponse.ok || !googleResponse.body) throw new Error('Google image download failed')
+  // mediaFile.baseUrl is a temporary signed URL from Google's Photos Picker API.
+  // Fetch it directly — do not append =d or any suffix, and do not add an
+  // Authorization header (the URL is already authenticated via its signature).
+  const googleResponse = await fetch(baseUrl)
+  if (!googleResponse.ok) throw new GooglePhotosApiError(googleResponse.status, 'Google image download failed')
+  if (!googleResponse.body) throw new Error('Google image download failed')
 
   const contentLength = Number(googleResponse.headers.get('content-length'))
   if (contentLength > maxFileSize) throw new Error('Google image is too large')
@@ -112,6 +134,15 @@ const downloadGoogleImage = async (baseUrl, token) => {
     chunks.push(chunk)
   }
   return Buffer.concat(chunks)
+}
+
+const googleErrorResponse = (error, fallbackMessage) => {
+  if (error instanceof GooglePhotosApiError) {
+    if (error.status === 401 || error.status === 403) return { status: 401, message: 'Google Photos authorization expired or the selected media is no longer accessible' }
+    if (error.status === 404) return { status: 404, message: 'The Google Photos picker session has expired' }
+    if (error.status === 409 || error.status === 412) return { status: 409, message: 'Finish selecting photos before importing' }
+  }
+  return { status: 502, message: fallbackMessage }
 }
 
 const safeFilename = (filename) => (filename || 'google-photo.jpg').replace(/[^a-zA-Z0-9._ -]/g, '_').slice(0, 180)
@@ -138,13 +169,13 @@ router.get('/', async (request, response) => {
 
   try {
     const [photos, total] = await Promise.all([
-      Photo.find({ owner: request.user.userId })
+      Photo.find({}).select('-cloudinaryUrl -cloudinaryPublicId')
         .populate('owner', 'name')
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
         .lean(),
-      Photo.countDocuments({ owner: request.user.userId }),
+      Photo.countDocuments(),
     ])
 
     return response.json({
@@ -171,28 +202,10 @@ router.get('/:id/file', async (request, response) => {
     if (!photo) {
       return response.status(404).json({ message: 'Photo not found' })
     }
-    if (photo.owner.toString() !== request.user.userId) {
-      return response.status(403).json({ message: 'You do not have permission to view this photo' })
-    }
-
-    const file = await findGridFsFile(photo.gridfsFileId)
-    if (!file) {
+    if (!photo.cloudinaryPublicId) {
       return response.status(404).json({ message: 'Photo file not found' })
     }
-
-    response.type(file.contentType || 'image/jpeg')
-    response.set('Content-Length', file.length.toString())
-
-    const downloadStream = openGridFsDownload(photo.gridfsFileId)
-    downloadStream.once('error', () => {
-      if (!response.headersSent) {
-        response.status(404).json({ message: 'Photo file not found' })
-      } else {
-        response.destroy()
-      }
-    })
-    downloadStream.pipe(response)
-    return undefined
+    return response.redirect(302, getCloudinaryPhotoUrl(photo.cloudinaryPublicId))
   } catch {
     return response.status(500).json({ message: 'Unable to fetch photo file' })
   }
@@ -240,14 +253,17 @@ router.delete('/:id', async (request, response) => {
       return response.status(403).json({ message: 'You do not have permission to delete this photo' })
     }
 
-    const file = await findGridFsFile(photo.gridfsFileId)
-    if (file) {
-      await deleteGridFsFile(photo.gridfsFileId)
+    await deleteCloudinaryPhoto(photo.cloudinaryPublicId)
+    try {
+      await photo.deleteOne()
+    } catch (error) {
+      console.error('Photo storage was deleted but database record deletion failed:', error)
+      return response.status(500).json({ message: 'The photo storage was removed, but the gallery record could not be deleted. Contact support.' })
     }
-    await photo.deleteOne()
 
     return response.status(204).send()
-  } catch {
+  } catch (error) {
+    console.error('Unable to delete photo:', error)
     return response.status(500).json({ message: 'Unable to delete photo' })
   }
 })
@@ -267,50 +283,57 @@ router.post('/', uploadRateLimit, parseUploads, async (request, response) => {
     return response.status(400).json({ message: 'Description must be 500 characters or fewer' })
   }
 
-  const storedFileIds = []
   const createdPhotos = []
+  const failures = []
 
-  try {
-    for (const file of request.files) {
-      await assertStorageQuota(request.user.userId, file.size)
-      const storedPhoto = await processAndStorePhoto(file.buffer, file.originalname, request.user.userId)
-      storedFileIds.push(storedPhoto.gridfsFileId)
-
+  for (const file of request.files) {
+    let storedPhoto
+    try {
+      storedPhoto = await processAndStorePhoto(file.buffer, file.originalname, request.user.userId)
+      await assertStorageQuota(request.user.userId, storedPhoto.size)
       const photo = await Photo.create({
         owner: request.user.userId,
-        originalFilename: file.originalname,
-        gridfsFileId: storedPhoto.gridfsFileId,
+        originalFilename: safeFilename(file.originalname),
+        cloudinaryPublicId: storedPhoto.cloudinaryPublicId,
+        cloudinaryUrl: storedPhoto.cloudinaryUrl,
         size: storedPhoto.size,
         description,
       })
       createdPhotos.push(photo)
+    } catch (error) {
+      if (storedPhoto?.cloudinaryPublicId) {
+        await deleteCloudinaryPhoto(storedPhoto.cloudinaryPublicId).catch(() => undefined)
+      }
+      failures.push({
+        filename: safeFilename(file.originalname),
+        message: error.statusCode === 413
+          ? 'Your storage quota has been exceeded'
+          : error.message?.includes('dimensions exceed')
+            ? 'Image dimensions exceed the allowed limit'
+            : 'This image could not be processed',
+      })
     }
-
-    return response.status(201).json({ photos: createdPhotos })
-  } catch (error) {
-    await Promise.all(storedFileIds.map((fileId) => deleteGridFsFile(fileId).catch(() => undefined)))
-    if (createdPhotos.length) {
-      await Photo.deleteMany({ _id: { $in: createdPhotos.map((photo) => photo._id) } })
-    }
-
-    if (error.statusCode === 413) {
-      return response.status(413).json({ message: 'Your storage quota has been exceeded' })
-    }
-    if (
-      error.message?.includes('unsupported image format')
-      || error.message?.includes('Unsupported image format')
-      || error.message?.includes('dimensions exceed')
-    ) {
-      return response.status(400).json({ message: 'One or more images could not be processed' })
-    }
-    return response.status(500).json({ message: 'Unable to upload photos' })
   }
+
+  if (!createdPhotos.length) {
+    const quotaExceeded = failures.some((failure) => failure.message === 'Your storage quota has been exceeded')
+    return response.status(quotaExceeded ? 413 : 400).json({ message: quotaExceeded ? 'Your storage quota has been exceeded' : 'No photos could be uploaded', failures })
+  }
+  return response.status(failures.length ? 207 : 201).json({ photos: createdPhotos, failures })
 })
 
 router.post('/google/session', googleImportRateLimit, async (request, response) => {
   try {
+    console.info('[GooglePhotos] SESSION_CREATE_STARTED: Creating picker session', {
+      owner: request.user.userId,
+      maxItemCount: maxFilesPerUpload,
+    })
+
     const token = await getGoogleTokenForUser(request.user.userId)
     if (!token) {
+      console.error('[GooglePhotos] SESSION_CREATE_STARTED: No Google token for user', {
+        owner: request.user.userId,
+      })
       return response.status(409).json({ message: 'Connect Google Photos before importing' })
     }
 
@@ -319,47 +342,144 @@ router.post('/google/session', googleImportRateLimit, async (request, response) 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pickingConfig: { maxItemCount: maxFilesPerUpload } }),
     })
+
+    console.info('[GooglePhotos] SESSION_CREATED: Picker session created', {
+      sessionId: session.id,
+      owner: request.user.userId,
+      expireTime: session.expireTime,
+      hasPickerUri: Boolean(session.pickerUri),
+    })
+
     await GooglePickerSession.create({ sessionId: session.id, owner: request.user.userId })
+
+    console.info('[GooglePhotos] SESSION_CREATED: Picker session stored in database', {
+      sessionId: session.id,
+      owner: request.user.userId,
+    })
+
+    if (!session.pickerUri) {
+      console.error('[GooglePhotos] SESSION_CREATED: pickerUri missing from Google response', {
+        sessionId: session.id,
+        owner: request.user.userId,
+      })
+      throw new Error('Google Photos picker URI is missing from session creation response')
+    }
+
+    // pickerUri must be used as-is per the official Photos Picker API.
+    // Do not append /autoclose or any other path segment.
     return response.status(201).json({ sessionId: session.id, pickerUri: session.pickerUri })
-  } catch {
-    return response.status(502).json({ message: 'Unable to start Google Photos import' })
+  } catch (error) {
+    console.error('[GooglePhotos] SESSION_CREATE_STARTED: Failed', {
+      owner: request.user.userId,
+      status: error.status,
+      message: error.message,
+    })
+    const failure = googleErrorResponse(error, 'Unable to start Google Photos import')
+    return response.status(failure.status).json({ message: failure.message })
   }
 })
 
 router.get('/google/session/:sessionId', async (request, response) => {
   try {
+    console.info('[GooglePhotos] POLLING_STARTED: Checking session status', {
+      sessionId: request.params.sessionId,
+      owner: request.user.userId,
+    })
+
     const session = await getOwnedPickerSession(request.params.sessionId, request.user.userId)
-    if (!session) return response.status(404).json({ message: 'Google Photos session not found' })
+    if (!session) {
+      console.error('[GooglePhotos] POLLING_STARTED: Session not found', {
+        sessionId: request.params.sessionId,
+        owner: request.user.userId,
+      })
+      return response.status(404).json({ message: 'Google Photos session not found' })
+    }
 
     const token = await getGoogleTokenForUser(request.user.userId)
-    if (!token) return response.status(401).json({ message: 'Google Photos authorization expired' })
+    if (!token) {
+      console.error('[GooglePhotos] POLLING_STARTED: Google authorization expired', {
+        sessionId: session.sessionId,
+        owner: request.user.userId,
+      })
+      return response.status(401).json({ message: 'Google Photos authorization expired' })
+    }
 
     const status = await googleRequest(`${googleApiBase}/sessions/${encodeURIComponent(session.sessionId)}`, token)
+    console.info('[GooglePhotos] SESSION_STATUS: Polled Google Photos session', {
+      sessionId: session.sessionId,
+      owner: request.user.userId,
+      mediaItemsSet: status.mediaItemsSet === true,
+      state: status.state,
+      expireTime: status.expireTime,
+      pollingInterval: status.pollingConfig?.pollInterval,
+    })
     return response.json({ mediaItemsSet: status.mediaItemsSet === true, pollingConfig: status.pollingConfig })
-  } catch {
-    return response.status(502).json({ message: 'Unable to check Google Photos session' })
+  } catch (error) {
+    console.error('[GooglePhotos] POLLING_STARTED: Failed to check session', {
+      sessionId: request.params.sessionId,
+      owner: request.user.userId,
+      status: error.status,
+      message: error.message,
+    })
+    const failure = googleErrorResponse(error, 'Unable to check Google Photos session')
+    return response.status(failure.status).json({ message: failure.message })
   }
 })
 
 router.post('/google/import', googleImportRateLimit, async (request, response) => {
   const parsed = googleImportSchema.safeParse(request.body)
   if (!parsed.success) {
+    console.error('[GooglePhotos] IMPORT_FAILED: Invalid request body', {
+      owner: request.user.userId,
+    })
     return response.status(400).json({ message: 'A Google Photos session is required' })
   }
   const { sessionId } = parsed.data
 
-  const storedFileIds = []
+  const storedCloudinaryIds = []
   const createdPhotos = []
+  const failures = []
+  let selectedCount = 0
 
   try {
+    console.info('[GooglePhotos] MEDIA_RETRIEVAL_STARTED: Importing selected photos', {
+      sessionId,
+      owner: request.user.userId,
+    })
+
     const session = await getOwnedPickerSession(sessionId, request.user.userId)
-    if (!session) return response.status(404).json({ message: 'Google Photos session not found' })
+    if (!session) {
+      console.error('[GooglePhotos] IMPORT_FAILED: Session not found', {
+        sessionId,
+        owner: request.user.userId,
+      })
+      return response.status(404).json({ message: 'Google Photos session not found' })
+    }
 
     const token = await getGoogleTokenForUser(request.user.userId)
-    if (!token) return response.status(401).json({ message: 'Google Photos authorization expired' })
+    if (!token) {
+      console.error('[GooglePhotos] IMPORT_FAILED: Google authorization expired', {
+        sessionId,
+        owner: request.user.userId,
+      })
+      return response.status(401).json({ message: 'Google Photos authorization expired' })
+    }
 
     const status = await googleRequest(`${googleApiBase}/sessions/${encodeURIComponent(sessionId)}`, token)
-    if (!status.mediaItemsSet) return response.status(409).json({ message: 'Finish selecting photos before importing' })
+    if (!status.mediaItemsSet) {
+      console.error('[GooglePhotos] IMPORT_FAILED: Selection not completed', {
+        sessionId,
+        owner: request.user.userId,
+        mediaItemsSet: status.mediaItemsSet,
+      })
+      return response.status(409).json({ message: 'Finish selecting photos before importing' })
+    }
+
+    console.info('[GooglePhotos] MEDIA_ITEMS_SET: Selection confirmed by Google Photos', {
+      sessionId,
+      owner: request.user.userId,
+      state: status.state,
+    })
 
     const mediaItems = []
     let pageToken
@@ -371,29 +491,133 @@ router.post('/google/import', googleImportRateLimit, async (request, response) =
       pageToken = page.nextPageToken
     } while (pageToken && mediaItems.length < maxFilesPerUpload)
 
+    selectedCount = mediaItems.length
+    console.info('[GooglePhotos] MEDIA_RETRIEVED: Selected media items', {
+      sessionId,
+      owner: request.user.userId,
+      selectedCount,
+      pageCount: mediaItems.length,
+    })
+
+    if (selectedCount === 0) {
+      console.error('[GooglePhotos] IMPORT_FAILED: No photos selected', {
+        sessionId,
+        owner: request.user.userId,
+      })
+      await GooglePickerSession.deleteOne({ _id: session._id })
+      await fetch(`${googleApiBase}/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }).catch(() => undefined)
+      return response.status(409).json({ message: 'No photos were selected in Google Photos' })
+    }
+
     for (const item of mediaItems.slice(0, maxFilesPerUpload)) {
       const mediaFile = item.mediaFile
-      if (!mediaFile?.baseUrl || !mediaFile.mimeType?.startsWith('image/')) continue
+      const filename = safeFilename(mediaFile?.filename)
+      if (!mediaFile?.baseUrl || !mediaFile.mimeType?.startsWith('image/')) {
+        failures.push({ filename, message: 'This selected item is not an accessible image' })
+        continue
+      }
 
-      const imageBuffer = await downloadGoogleImage(mediaFile.baseUrl, token)
-      await assertStorageQuota(request.user.userId, imageBuffer.length)
-      const storedPhoto = await processAndStorePhoto(imageBuffer, safeFilename(mediaFile.filename), request.user.userId)
-      storedFileIds.push(storedPhoto.gridfsFileId)
-      createdPhotos.push(await Photo.create({
+      // Duplicate prevention: skip if a photo with the same name and owner was recently imported
+      const recentDuplicate = await Photo.findOne({
         owner: request.user.userId,
-        originalFilename: safeFilename(mediaFile.filename),
-        gridfsFileId: storedPhoto.gridfsFileId,
-        size: storedPhoto.size,
-      }))
+        originalFilename: filename,
+        createdAt: { $gte: new Date(Date.now() - 10 * 60 * 1000) },
+      })
+      if (recentDuplicate) {
+        console.info('[GooglePhotos] IMPORT_FAILED: Duplicate skipped', {
+          sessionId,
+          owner: request.user.userId,
+          filename,
+        })
+        failures.push({ filename, message: 'Duplicate import skipped' })
+        continue
+      }
+
+      let storedPhoto
+      try {
+        console.info('[GooglePhotos] IMAGE_DOWNLOAD_STARTED: Downloading image', {
+          sessionId,
+          owner: request.user.userId,
+          filename,
+          mimeType: mediaFile.mimeType,
+        })
+        const imageBuffer = await downloadGoogleImage(mediaFile.baseUrl)
+        console.info('[GooglePhotos] IMAGE_DOWNLOAD_SUCCESS: Image downloaded', {
+          sessionId,
+          owner: request.user.userId,
+          filename,
+          downloadedBytes: imageBuffer.length,
+        })
+
+        await assertStorageQuota(request.user.userId, imageBuffer.length)
+        storedPhoto = await processAndStorePhoto(imageBuffer, filename, request.user.userId)
+        storedCloudinaryIds.push(storedPhoto.cloudinaryPublicId)
+        await assertStorageQuota(request.user.userId, storedPhoto.size - imageBuffer.length)
+
+        console.info('[GooglePhotos] CLOUDINARY_UPLOAD_SUCCESS: Image stored', {
+          sessionId,
+          owner: request.user.userId,
+          filename,
+          cloudinaryPublicId: storedPhoto.cloudinaryPublicId,
+          storedBytes: storedPhoto.size,
+        })
+
+        createdPhotos.push(await Photo.create({
+          owner: request.user.userId,
+          originalFilename: filename,
+          cloudinaryPublicId: storedPhoto.cloudinaryPublicId,
+          cloudinaryUrl: storedPhoto.cloudinaryUrl,
+          size: storedPhoto.size,
+        }))
+        console.info('[GooglePhotos] MONGODB_SAVE_SUCCESS: Photo record saved', {
+          sessionId,
+          owner: request.user.userId,
+          filename,
+          photoId: createdPhotos[createdPhotos.length - 1]?._id,
+        })
+      } catch (error) {
+        if (storedPhoto?.cloudinaryPublicId) {
+          await deleteCloudinaryPhoto(storedPhoto.cloudinaryPublicId).catch(() => undefined)
+        }
+        failures.push({
+          filename,
+          message: error instanceof GooglePhotosApiError && (error.status === 401 || error.status === 403)
+            ? 'This selected image is no longer accessible'
+            : 'This selected image could not be imported',
+        })
+        console.error('[GooglePhotos] IMPORT_FAILED: Image import failed', {
+          sessionId,
+          owner: request.user.userId,
+          filename,
+          error: error.message,
+        })
+      }
     }
 
     await GooglePickerSession.deleteOne({ _id: session._id })
-    await fetch(`${googleApiBase}/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } })
-    return response.status(201).json({ photos: createdPhotos })
-  } catch {
-    await Promise.all(storedFileIds.map((fileId) => deleteGridFsFile(fileId).catch(() => undefined)))
+    await fetch(`${googleApiBase}/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }).catch(() => undefined)
+
+    console.info('[GooglePhotos] IMPORT_COMPLETED: Import finished', {
+      sessionId,
+      owner: request.user.userId,
+      selectedCount,
+      importedCount: createdPhotos.length,
+      failureCount: failures.length,
+    })
+
+    if (!createdPhotos.length) return response.status(502).json({ message: 'No selected Google Photos could be imported', failures })
+    return response.status(failures.length ? 207 : 201).json({ photos: createdPhotos, failures, selectedCount, importedCount: createdPhotos.length })
+  } catch (error) {
+    await Promise.all(storedCloudinaryIds.map((publicId) => deleteCloudinaryPhoto(publicId).catch(() => undefined)))
     if (createdPhotos.length) await Photo.deleteMany({ _id: { $in: createdPhotos.map((photo) => photo._id) } })
-    return response.status(502).json({ message: 'Unable to import Google Photos' })
+    console.error('[GooglePhotos] IMPORT_FAILED: Import error', {
+      sessionId,
+      owner: request.user.userId,
+      status: error.status,
+      message: error.message,
+    })
+    const failure = googleErrorResponse(error, 'Unable to import Google Photos')
+    return response.status(failure.status).json({ message: failure.message })
   }
 })
 
